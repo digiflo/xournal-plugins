@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y lua5.4 luacheck qpdf python3-pip
+      - name: Install Python deps
+        run: pip install reportlab pypdf
+      - name: Run test suite
+        run: bash tests/run_all.sh

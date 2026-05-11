@@ -1,0 +1,18 @@
+# Test fixtures created on the fly
+tests/fixtures/_unit_*.pdf
+tests/fixtures/_unit_*.xopp
+tests/fixtures/e2e_*.pdf
+tests/fixtures/e2e_*.xopp
+tests/fixtures/work.xopp
+
+# Backup artifacts created by the plugin during use
+*.bak-*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
