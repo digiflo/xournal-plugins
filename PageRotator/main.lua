@@ -10,9 +10,14 @@ local function isWindows()
     return package.config:sub(1, 1) == "\\"
 end
 
--- Debug log so we can diagnose what happens in the launchd-spawned
--- Xournal++ process where stdout is not visible.
-local LOG_PATH = (os.getenv("HOME") or "/tmp") .. "/PageRotator.log"
+-- Debug log so we can diagnose what happens in the GUI-spawned Xournal++
+-- process where stdout is not visible.
+local LOG_PATH = (function()
+    if package.config:sub(1, 1) == "\\" then
+        return (os.getenv("USERPROFILE") or "C:\\") .. "\\PageRotator.log"
+    end
+    return (os.getenv("HOME") or "/tmp") .. "/PageRotator.log"
+end)()
 local function log(msg)
     local f = io.open(LOG_PATH, "a")
     if f then
@@ -41,15 +46,42 @@ local function fileExists(path)
     return false
 end
 
--- Resolve `qpdf` even when launchd-started GUI apps have a minimal PATH
--- (typical on macOS: /opt/homebrew/bin is missing).
+-- Glob a directory pattern in Lua via the shell. Returns the first match
+-- that exists, or nil.
+local function firstGlob(patterns)
+    if not patterns or #patterns == 0 then return nil end
+    local cmd
+    if isWindows() then
+        -- Use PowerShell so we can resolve wildcards predictably
+        local joined = ""
+        for _, p in ipairs(patterns) do
+            joined = joined .. "'" .. p:gsub("'", "''") .. "',"
+        end
+        cmd = "powershell -NoProfile -Command \"@(" .. joined ..
+              ") | ForEach-Object { Get-ChildItem -Path $_ -ErrorAction SilentlyContinue } | " ..
+              "Select-Object -First 1 -ExpandProperty FullName\""
+    else
+        cmd = "ls -1 " .. table.concat(patterns, " ") .. " 2>/dev/null | head -n1"
+    end
+    local h = io.popen(cmd, "r")
+    if not h then return nil end
+    local line = h:read("*l")
+    h:close()
+    if line and line ~= "" then return line end
+    return nil
+end
+
+-- Resolve `qpdf` even when GUI-spawned apps have a minimal PATH (typical on
+-- macOS: /opt/homebrew/bin is missing; on Windows: launchers don't inherit
+-- the chocolatey PATH right after install).
 local function resolveQpdf()
     local candidates
     if isWindows() then
         candidates = {
-            "qpdf.exe",
+            "C:\\ProgramData\\chocolatey\\bin\\qpdf.exe", -- Choco shim
             "C:\\Program Files\\qpdf\\bin\\qpdf.exe",
-            "C:\\ProgramData\\chocolatey\\bin\\qpdf.exe",
+            "C:\\Program Files (x86)\\qpdf\\bin\\qpdf.exe",
+            "C:\\msys64\\usr\\bin\\qpdf.exe",
         }
     else
         candidates = {
@@ -77,9 +109,15 @@ local function resolveQpdf()
             return found
         end
     end
-    -- Last resort: rely on PATH at exec time
+    -- Windows: try chocolatey's versioned lib dir (e.g.
+    --   C:\ProgramData\chocolatey\lib\qpdf\tools\qpdf-12.x.x\bin\qpdf.exe)
     if isWindows() then
-        return "qpdf.exe"
+        local globbed = firstGlob({
+            "C:\\ProgramData\\chocolatey\\lib\\qpdf\\tools\\*\\bin\\qpdf.exe",
+            "C:\\ProgramData\\chocolatey\\lib\\qpdf*\\tools\\bin\\qpdf.exe",
+        })
+        if globbed then return globbed end
+        return "qpdf.exe"  -- final fallback, trust PATH at exec time
     end
     return nil
 end
@@ -90,6 +128,101 @@ local function shellQuote(s)
         return '"' .. s:gsub('"', '\\"') .. '"'
     end
     return "'" .. s:gsub("'", [['\'']]) .. "'"
+end
+
+-- ---------------------------------------------------------------------------
+-- Gzip helpers (cross-platform). Windows has no gzip/gunzip out of the box,
+-- so we fall back to a tiny PowerShell script using .NET GZipStream.
+-- ---------------------------------------------------------------------------
+
+local function tmpDir()
+    if isWindows() then
+        return os.getenv("TEMP") or os.getenv("TMP") or "C:\\Windows\\Temp"
+    end
+    return os.getenv("TMPDIR") or "/tmp"
+end
+
+local function pathSep()
+    return isWindows() and "\\" or "/"
+end
+
+local function decompressGzipFile(srcPath)
+    if isWindows() then
+        local outFile = tmpDir() .. pathSep() .. "PageRotator_xml.txt"
+        local scriptFile = tmpDir() .. pathSep() .. "PageRotator_decompress.ps1"
+        local script = string.format(
+            '$b=[IO.File]::ReadAllBytes(%q)\n' ..
+            '$ms=New-Object IO.MemoryStream\n' ..
+            '$ms.Write($b,0,$b.Length)\n' ..
+            '$ms.Position=0\n' ..
+            '$gz=New-Object IO.Compression.GZipStream($ms,[IO.Compression.CompressionMode]::Decompress)\n' ..
+            '$sr=New-Object IO.StreamReader($gz,[Text.Encoding]::UTF8)\n' ..
+            '[IO.File]::WriteAllText(%q,$sr.ReadToEnd(),[Text.Encoding]::UTF8)\n',
+            srcPath, outFile
+        )
+        local f = io.open(scriptFile, "w")
+        if not f then return nil, "cannot write ps1" end
+        f:write(script); f:close()
+        local cmd = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' .. scriptFile .. '"'
+        local rc = os.execute(cmd)
+        os.remove(scriptFile)
+        if rc ~= true and rc ~= 0 then return nil, "powershell decompress failed" end
+        local r = io.open(outFile, "rb")
+        if not r then return nil, "cannot read decompressed tmp" end
+        local content = r:read("*a"); r:close()
+        os.remove(outFile)
+        if not content or content == "" then return nil, "decompressed empty" end
+        return content
+    end
+    local h = io.popen(gunzipBin() .. " -c " .. shellQuote(srcPath), "r")
+    if not h then return nil, "gunzip popen failed" end
+    local content = h:read("*a")
+    h:close()
+    if not content or content == "" then return nil, "decompressed empty" end
+    return content
+end
+
+local function compressGzipFile(content, dstPath)
+    if isWindows() then
+        local inFile = tmpDir() .. pathSep() .. "PageRotator_in.xml"
+        local scriptFile = tmpDir() .. pathSep() .. "PageRotator_compress.ps1"
+        local fi = io.open(inFile, "wb")
+        if not fi then return false, "cannot write tmp in" end
+        fi:write(content); fi:close()
+        local script = string.format(
+            '$bytes=[IO.File]::ReadAllBytes(%q)\n' ..
+            '$fs=[IO.File]::Create(%q)\n' ..
+            '$gz=New-Object IO.Compression.GZipStream($fs,[IO.Compression.CompressionMode]::Compress)\n' ..
+            '$gz.Write($bytes,0,$bytes.Length)\n' ..
+            '$gz.Close()\n' ..
+            '$fs.Close()\n',
+            inFile, dstPath
+        )
+        local f = io.open(scriptFile, "w")
+        if not f then return false, "cannot write ps1" end
+        f:write(script); f:close()
+        local cmd = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' .. scriptFile .. '"'
+        local rc = os.execute(cmd)
+        os.remove(scriptFile)
+        os.remove(inFile)
+        if rc ~= true and rc ~= 0 then return false, "powershell compress failed" end
+        return true
+    end
+    local tmpGz = dstPath .. ".pagerotator.tmp.gz"
+    local hw = io.popen(gzipBin() .. " -c > " .. shellQuote(tmpGz), "w")
+    if not hw then return false, "gzip popen failed" end
+    hw:write(content)
+    if not hw:close() then os.remove(tmpGz); return false, "gzip write failed" end
+    if not os.rename(tmpGz, dstPath) then
+        local fi = io.open(tmpGz, "rb")
+        if not fi then return false, "rename failed and tmp unreadable" end
+        local data = fi:read("*a"); fi:close()
+        local fo = io.open(dstPath, "wb")
+        if not fo then os.remove(tmpGz); return false, "cannot write final" end
+        fo:write(data); fo:close()
+        os.remove(tmpGz)
+    end
+    return true
 end
 
 -- Directly rewrite the width/height attributes of selected <page> elements
@@ -113,17 +246,11 @@ function editXoppPageDimensions(xoppPath, dims)
     end
     log("  dims count: " .. dimsCount)
 
-    -- 1. Decompress via io.popen so the shell redirection isn't required.
-    local h = io.popen(gunzipBin() .. " -c " .. shellQuote(xoppPath), "r")
-    if not h then
-        log("  gunzip popen failed")
-        return false, "gunzip popen failed"
-    end
-    local content = h:read("*a")
-    local okClose = h:close()
-    if not content or content == "" then
-        log("  decompressed xml is empty (close ok=" .. tostring(okClose) .. ")")
-        return false, "decompressed xml is empty"
+    -- 1. Decompress
+    local content, err = decompressGzipFile(xoppPath)
+    if not content then
+        log("  decompress failed: " .. tostring(err))
+        return false, err
     end
     log("  decompressed length: " .. #content)
 
@@ -143,31 +270,11 @@ function editXoppPageDimensions(xoppPath, dims)
         end)
     log(string.format("  pages found: %d, pages swapped: %d", idx, swappedPages))
 
-    -- 3. Write back via io.popen "w" mode so gzip reads from stdin and
-    --    writes straight into the original file (atomic enough).
-    local tmpGz = xoppPath .. ".pagerotator.tmp.gz"
-    local hw = io.popen(gzipBin() .. " -c > " .. shellQuote(tmpGz), "w")
-    if not hw then
-        log("  gzip popen failed")
-        return false, "gzip popen failed"
-    end
-    hw:write(content)
-    local okWrite = hw:close()
-    if not okWrite then
-        log("  gzip write/close failed")
-        os.remove(tmpGz)
-        return false, "gzip write failed"
-    end
-
-    -- 4. Atomically replace
-    local rc = os.rename(tmpGz, xoppPath)
-    if not rc then
-        -- Fallback: copy + remove (rename can fail across filesystems)
-        local fi = io.open(tmpGz, "rb"); if not fi then return false, "rename failed and tmp unreadable" end
-        local data = fi:read("*a"); fi:close()
-        local fo = io.open(xoppPath, "wb"); if not fo then return false, "cannot write final xopp" end
-        fo:write(data); fo:close()
-        os.remove(tmpGz)
+    -- 3. Re-compress, overwriting the original
+    local okC, errC = compressGzipFile(content, xoppPath)
+    if not okC then
+        log("  compress failed: " .. tostring(errC))
+        return false, errC
     end
 
     log("  editXopp: done")
